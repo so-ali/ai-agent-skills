@@ -28,7 +28,10 @@ This document defines the rules, project structure, and standards that any AI ag
   - If a component starts mixing rendering with business rules, split it into a container + a presentational component.
 - Follow **Clean Code** principles: meaningful names, small functions/components (prefer under ~150–200 lines), avoid deep nesting, no magic numbers/strings (use `consts`), no dead code, self-documenting code over excessive comments.
 - Follow **Clean Architecture** principles across the layers defined in this guide:
-  - **Dependency Rule**: dependencies only point inward/downward (`components → hooks → queries → services → API`); a lower layer must never import from a higher layer (e.g. `services` must never import from `hooks` or `components`).
+  - **Dependency Rule**: dependencies only point inward/downward (`components → hooks → queries → services → API/DB`); a lower layer must never import from a higher layer (e.g. `services` must never import from `hooks` or `components`).
+  - **UI & Database Decoupling**: The UI layer must **never** connect or communicate directly with the database. Components only interact with data through custom hooks.
+  - **In-Memory Store First & Optimistic Updates**: All data mutations (create, update, delete) are applied temporarily/optimistically to the state management system (Zustand store) first, and then persisted immediately to the local database via services.
+  - **Startup Hydration & Store-Backed Reads**: At application startup, all database models are imported/hydrated from SQLite into their respective stores. Throughout the app, data is read exclusively from these stores via custom hooks, ensuring instantaneous, reactive in-memory reads.
   - **SOLID**: especially Single Responsibility (one reason to change per file/component/hook) and Dependency Inversion (depend on `types`/interfaces, not concrete implementations, where it adds value).
   - **DRY**: shared logic goes into `hooks`/`utils`, shared data shapes go into `types`, shared fixtures go into `tests/factories`.
   - **KISS/YAGNI**: prefer the simplest solution that satisfies the requirement; do not add abstraction layers or configuration for hypothetical future needs.
@@ -40,28 +43,28 @@ This document defines the rules, project structure, and standards that any AI ag
 ```
 src/
 ├── components/       # Reusable UI components
-├── context/           # React Context Providers
-├── hooks/             # Generic and feature-related custom hooks
-├── queries/           # Data-fetching layer (React Query), per model
-├── services/          # API / database communication layer, per model
-├── stores/            # Global state management (Zustand/Redux/...)
-├── types/             # Type and Interface definitions, per model
-├── utils/             # Pure helper functions
-├── libs/              # Third-party library configs/wrappers (axios, storage, ...)
-├── consts/            # Constant values (colors, routes, enums, config)
-├── tests/             # Test utilities, mocks, and setup shared across the app
+├── context/          # React Context Providers
+├── hooks/            # Generic and feature-related custom hooks
+├── queries/          # Remote data-fetching / sync layer (React Query), per model
+├── services/         # API / database communication layer, per model
+├── stores/           # Global state management & in-memory model stores (Zustand)
+├── types/            # Type and Interface definitions, per model
+├── utils/            # Pure helper functions
+├── libs/             # Third-party library configs/wrappers (axios, storage, ...)
+├── consts/           # Constant values (colors, routes, enums, config)
+├── tests/            # Test utilities, mocks, and setup shared across the app
 ```
 
 ### Rules per Folder
 
 | Folder | Responsibility | Notes |
 |---|---|---|
-| `components` | Pure UI, no direct API calls | Organize by feature or atomic design (`common/`, `screens/`, ...) |
+| `components` | Pure UI, no direct DB or API calls | Organize by feature or atomic design (`common/`, `screens/`, ...). Only consumes `hooks` |
 | `context` | Context API + Providers | Only for state that is truly global/cross-cutting |
-| `hooks` | Reusable logic | Each hook should have a single responsibility |
-| `queries` | Query/mutation definitions (e.g. React Query) | Consumes `services` directly, never raw API calls |
-| `services` | API/database calls (axios, fetch, SQLite) | No UI logic; pure input/output of data. **Only** layer allowed to touch SQLite directly |
-| `stores` | App-wide **client** state via **Zustand** | e.g. user session, theme, UI flags — never server/DB data |
+| `hooks` | Reusable logic & data access facade | Reads from stores via selectors, triggers optimistic store updates & immediate DB persistence |
+| `queries` | Remote sync & query/mutation definitions (e.g. React Query) | Consumes `services` directly for remote API sync |
+| `services` | API/database calls (axios, fetch, SQLite) | Handles raw DB/API calls: hydration on boot (`getAll`) and immediate persistence on mutations. **Only** layer allowed to touch SQLite directly |
+| `stores` | App-wide state & in-memory model stores via **Zustand** | Hydrated from SQLite on startup; updated optimistically on mutations; read via hooks |
 | `types` | Interface/Type + **Zod** schema per model | Types are inferred from Zod schemas (single source of truth) |
 | `utils` | Pure, side-effect-free functions | Date formatting, formatting helpers, etc. |
 | `libs` | Third-party library setup | e.g. `libs/axios.ts`, `libs/sqlite.ts`, `libs/storage.ts` |
@@ -77,24 +80,30 @@ For **every database model** (e.g. `User`, `Product`, `Order`), the following st
 ```
 types/
 └── user/
-    └── User.types.ts          # Interfaces and types related to User
+    ├── User.types.ts          # Interfaces and types related to User
+    └── User.schema.ts         # Zod schema (source of truth for types)
+
+stores/
+└── user/
+    ├── user.store.ts          # In-memory model store (hydrated on boot, optimistic updates)
+    ├── user.store.test.ts     # Store unit tests
+    └── index.ts
 
 services/
 └── user/
-    ├── user.service.ts        # Raw API calls (CRUD)
-    ├── user.service.test.ts   # Unit tests for the service
+    ├── user.local.service.ts  # SQLite local operations (getAll for hydration, CRUD for persistence)
+    ├── user.service.ts        # Optional remote API calls (CRUD)
+    ├── user.local.service.test.ts # Local DB service tests
     └── index.ts                # barrel export
 
 queries/
 └── user/
-    ├── useUserQuery.ts         # Read operations (get, list)
-    ├── useUserMutation.ts      # Write operations (create, update, delete)
-    ├── useUserQuery.test.ts    # Unit tests for the query hooks
+    ├── useUserQuery.ts         # Remote sync / background queries (if remote API is used)
     └── index.ts
 
 hooks/
 └── user/
-    ├── useUser.ts               # Combines query/mutation + feature/form logic
+    ├── useUser.ts               # Reads from store, performs optimistic updates & immediate DB persistence
     ├── useUser.test.ts          # Unit tests for the hook
     └── index.ts
 
@@ -107,65 +116,158 @@ components/
 
 ### Data Flow Between Layers
 
+Data flow strictly adheres to three distinct pipelines:
+
 ```
-Component  →  hooks/  →  queries/  →  services/  →  API / DB
-                ↑             ↑            ↑
-             types/  ←────────┴────────────┘
+1. App Startup (Hydration):
+   SQLite DB  →  userLocalService.getAllUsers()  →  useUserStore.hydrateUsers()
+
+2. Read Flow (In-Memory Reactivity):
+   Component  →  useUser()  →  reads directly from useUserStore (Zustand)
+
+3. Write Flow (Store First, Immediate DB Persistence):
+   Component  →  useUser().createUser(payload)
+                     ↓
+         1. Apply immediately to useUserStore (optimistic / temporary update)
+                     ↓
+         2. Persist immediately to userLocalService (SQLite)
+            (Rollback store update if DB write fails)
 ```
 
-- **types**: defines the shape of the data (Model, DTO, Request/Response).
-- **services**: purely raw communication with the API; output must match `types`.
-- **queries**: uses `services` and manages server state/cache via React Query (or similar).
-- **hooks**: implements feature-level composite logic (forms, validation, combining multiple queries) on top of `queries`.
-- **components**: only consume `hooks`; never access `services` or `queries` directly.
+- **UI & Database Separation**: The UI (`components`) must **never** communicate directly with the database. Components only call `hooks`.
+- **In-Memory Store as Single Source of Truth**: At application launch, all persistent models are fetched from SQLite and hydrated into their corresponding Zustand stores.
+- **Hook-Based Reads**: Within the app, components read data exclusively from these stores via custom hooks (selectors), ensuring instantaneous UI renders without database latency.
+- **Optimistic State & Immediate Persistence**:
+  1. Any modification is applied immediately to the Zustand store so the UI updates instantly.
+  2. Immediately following the store update, the change is written to SQLite via the service.
+  3. If SQLite write fails, the store is rolled back and the error is surfaced.
 
 ### Example for the `User` Model
 
 **`types/user/User.types.ts`**
 ```ts
-export interface User {
-  id: string;
-  name: string;
-  email: string;
-  createdAt: string;
-}
+import { z } from 'zod';
 
-export interface CreateUserPayload {
-  name: string;
-  email: string;
-}
+export const userSchema = z.object({
+  id: z.string(),
+  name: z.string().min(2),
+  email: z.string().email(),
+  createdAt: z.string(),
+});
+
+export const createUserSchema = userSchema.omit({ id: true, createdAt: true });
+
+export type User = z.infer<typeof userSchema>;
+export type CreateUserPayload = z.infer<typeof createUserSchema>;
 ```
 
-**`services/user/user.service.ts`**
+**`stores/user/user.store.ts`**
 ```ts
-import { apiClient } from '@/libs';
-import type { User, CreateUserPayload } from '@/types';
+import { create } from 'zustand';
+import type { User } from '@/types';
 
-export const userService = {
-  getUser: (id: string) => apiClient.get<User>(`/users/${id}`),
-  createUser: (payload: CreateUserPayload) => apiClient.post<User>('/users', payload),
+interface UserState {
+  users: Record<string, User>;
+  hydrateUsers: (users: User[]) => void;
+  addUser: (user: User) => void;
+  updateUser: (user: User) => void;
+  removeUser: (id: string) => void;
+}
+
+export const useUserStore = create<UserState>((set) => ({
+  users: {},
+  hydrateUsers: (userList) =>
+    set({
+      users: Object.fromEntries(userList.map((u) => [u.id, u])),
+    }),
+  addUser: (user) =>
+    set((state) => ({ users: { ...state.users, [user.id]: user } })),
+  updateUser: (user) =>
+    set((state) => ({ users: { ...state.users, [user.id]: user } })),
+  removeUser: (id) =>
+    set((state) => {
+      const { [id]: _, ...rest } = state.users;
+      return { users: rest };
+    }),
+}));
+```
+
+**`services/user/user.local.service.ts`**
+```ts
+import { db } from '@/libs';
+import { userSchema } from '@/types';
+import type { User } from '@/types';
+
+export const userLocalService = {
+  getAllUsers: async (): Promise<User[]> => {
+    const rows = await db.getAllAsync('SELECT * FROM users');
+    return rows.map((row) => userSchema.parse(row));
+  },
+  insertUser: async (user: User): Promise<void> => {
+    await db.runAsync(
+      'INSERT INTO users (id, name, email, createdAt) VALUES (?, ?, ?, ?)',
+      [user.id, user.name, user.email, user.createdAt]
+    );
+  },
+  updateUser: async (user: User): Promise<void> => {
+    await db.runAsync(
+      'UPDATE users SET name = ?, email = ? WHERE id = ?',
+      [user.name, user.email, user.id]
+    );
+  },
+  deleteUser: async (id: string): Promise<void> => {
+    await db.runAsync('DELETE FROM users WHERE id = ?', [id]);
+  },
 };
-```
-
-**`queries/user/useUserQuery.ts`**
-```ts
-import { useQuery } from '@tanstack/react-query';
-import { userService } from '@/services';
-
-export const useUserQuery = (id: string) =>
-  useQuery({
-    queryKey: ['user', id],
-    queryFn: () => userService.getUser(id),
-  });
 ```
 
 **`hooks/user/useUser.ts`**
 ```ts
-import { useUserQuery } from '@/queries';
+import { useUserStore } from '@/stores';
+import { userLocalService } from '@/services';
+import type { CreateUserPayload, User } from '@/types';
 
-export const useUser = (id: string) => {
-  const { data, isLoading, error } = useUserQuery(id);
-  return { user: data, isLoading, error };
+export const useUser = (id?: string) => {
+  // Read state reactively from Zustand store
+  const user = useUserStore((state) => (id ? state.users[id] : undefined));
+  const allUsers = useUserStore((state) => Object.values(state.users));
+
+  const addUser = useUserStore((state) => state.addUser);
+  const removeUser = useUserStore((state) => state.removeUser);
+
+  const createUser = async (payload: CreateUserPayload) => {
+    const newUser: User = {
+      id: crypto.randomUUID(),
+      ...payload,
+      createdAt: new Date().toISOString(),
+    };
+
+    // 1. Temporarily/optimistically apply to state management (instant UI update)
+    addUser(newUser);
+
+    try {
+      // 2. Immediately persist to SQLite database
+      await userLocalService.insertUser(newUser);
+    } catch (error) {
+      // Rollback store if DB write fails
+      removeUser(newUser.id);
+      throw error;
+    }
+  };
+
+  return { user, allUsers, createUser };
+};
+```
+
+**App Startup Hydration (`libs/bootstrap.ts`)**
+```ts
+import { userLocalService } from '@/services';
+import { useUserStore } from '@/stores';
+
+export const hydrateAllStores = async () => {
+  // Load all persistent models from SQLite into their stores at boot
+  const users = await userLocalService.getAllUsers();
+  useUserStore.getState().hydrateUsers(users);
 };
 ```
 
@@ -173,10 +275,21 @@ export const useUser = (id: string) => {
 ```tsx
 import { useUser } from '@/hooks';
 
-const UserProfile = ({ id }: { id: string }) => {
-  const { user, isLoading } = useUser(id);
-  if (isLoading) return <Loading />;
-  return <Text>{user?.name}</Text>;
+export const UserList = () => {
+  // UI reads exclusively from the store via the hook
+  const { allUsers, createUser } = useUser();
+
+  return (
+    <View>
+      {allUsers.map((user) => (
+        <Text key={user.id}>{user.name}</Text>
+      ))}
+      <Button
+        title="Add User"
+        onPress={() => createUser({ name: 'Alice', email: 'alice@example.com' })}
+      />
+    </View>
+  );
 };
 ```
 
@@ -186,11 +299,20 @@ const UserProfile = ({ id }: { id: string }) => {
 
 ### 4.1 State Management — Zustand
 
-- **Zustand** is the only allowed library for global/app-wide state, placed in `stores/`.
-- Each store is scoped to a single concern (e.g. `stores/session.store.ts`, `stores/theme.store.ts`, `stores/order.store.ts`) — no single "god store".
-- Stores hold **client/UI state** (session, theme, filters, onboarding flags, ephemeral UI state) — never server or database data. Server/DB data always flows through `services` → `queries`/`hooks`, not through Zustand.
-- Stores are consumed directly by `hooks` (and, when trivial, by presentational-adjacent logic inside container components) — never mutated directly from deep inside presentational components; expose actions from the store instead of letting components write to state directly.
-- Naming: `useXStore` for the store hook itself (e.g. `useSessionStore`), file name `x.store.ts`.
+- **Zustand** is the only allowed library for global and app-wide state, placed in `stores/`.
+- **Dual Role**: Stores manage both **client/UI state** (session, theme, active filters, UI flags) and **in-memory model stores** (entities hydrated from the database).
+- Each store is scoped to a single concern or model (e.g. `stores/session/session.store.ts`, `stores/user/user.store.ts`, `stores/order/order.store.ts`) — never create a monolithic "god store".
+- **Startup Model Hydration**: When the application initializes/boots, all persistent models are loaded from SQLite via their respective `services` and hydrated into their Zustand stores (`hydrate*` action). The store serves as the fast in-memory cache and single source of truth during runtime.
+- **Hook-Based Reads**: Components **never** read directly from the database or services. They read from these stores exclusively via custom hooks with fine-grained selectors:
+  ```ts
+  const user = useUserStore((state) => state.users[userId]);
+  ```
+- **Store-First (Optimistic) Mutations & Immediate DB Persistence**:
+  1. Any write operation (create, update, delete) is applied temporarily/optimistically to the Zustand store first, ensuring instantaneous UI reactivity with 0ms latency.
+  2. The custom hook immediately persists the updated model to the local SQLite database via its `service`.
+  3. If the database write fails, the hook rolls back the store modification and surfaces an error.
+- Stores must expose explicit actions (`hydrate*`, `add*`, `update*`, `remove*`) — never mutate store state directly from outside.
+- Naming: `useXStore` for the store hook itself (e.g. `useSessionStore`, `useUserStore`), file name `x.store.ts`.
 
 ```ts
 // stores/session/session.store.ts
@@ -236,37 +358,15 @@ export type CreateUserPayload = z.infer<typeof createUserSchema>;
 
 - **SQLite** (e.g. `expo-sqlite` / `react-native-sqlite-storage` via a wrapper in `libs/sqlite.ts`) is the only allowed local persistence layer for structured/relational data.
 - The SQLite client/connection is configured **once** in `libs/sqlite.ts` and is never imported outside `services/`.
+- **The UI must NEVER connect to or interact with SQLite directly.** UI components interact exclusively through custom `hooks/`.
 - **No layer other than `services` may ever execute a raw SQL query or call the SQLite client directly.** This applies to `components`, `hooks`, `queries`, `stores`, and `context` alike.
-- Each model has its own DB-facing service function set, e.g. `services/user/user.local.service.ts`, alongside (or instead of) its remote `user.service.ts`, both exposed through the same barrel:
-
-```ts
-// services/user/user.local.service.ts
-import { db } from '@/libs';
-import { userRowSchema } from '@/types';
-import type { User } from '@/types';
-
-export const userLocalService = {
-  getUser: async (id: string): Promise<User> => {
-    const row = await db.getFirstAsync('SELECT * FROM users WHERE id = ?', [id]);
-    return userRowSchema.parse(row);
-  },
-  createUser: async (user: User): Promise<void> => {
-    await db.runAsync(
-      'INSERT INTO users (id, name, email, createdAt) VALUES (?, ?, ?, ?)',
-      [user.id, user.name, user.email, user.createdAt]
-    );
-  },
-};
-```
-
-- **Services must always be consumed through hooks, never called directly from components or from `stores`.** The mandatory chain for any data access (remote or local) is:
-
-  ```
-  Component → hooks/ → (queries/ →) services/ → SQLite / API
-  ```
-
-  - `queries/` may sit between `hooks` and `services` when caching/invalidation via React Query is useful (typical for reads).
-  - For simple local writes, a `hook` may call the `service` directly without a `queries` layer, but a `component` must never import a `service` itself.
+- **Two Touchpoints for SQLite Services**:
+  1. **Startup Hydration**: Services expose `getAll*` methods used during app boot to hydrate all persistent data into Zustand stores.
+  2. **Immediate Persistence**: Services expose write methods (`insert*`, `update*`, `delete*`) invoked by hooks immediately after applying optimistic in-memory updates in Zustand.
+- The mandatory data access chains are:
+  - **Reads**: `Component → hooks/ → store (Zustand)` (in-memory, instant)
+  - **Writes**: `Component → hooks/ → store (optimistic update) → services/ → SQLite DB (immediate persistence)`
+  - **Startup**: `App Bootstrap → services/ (getAll) → stores.hydrate()`
 - Schema/migrations for SQLite live in `libs/sqlite/migrations/`, applied once at app startup — never ad hoc inside a service call.
 
 ---
@@ -371,20 +471,26 @@ Rules:
 When adding a new database model (e.g. `Order`), the agent must follow these steps in order:
 
 1. `types/order/Order.types.ts` + `types/order/Order.schema.ts` → define the Zod schema and infer the Type from it
-2. `services/order/order.service.ts` (remote) and/or `services/order/order.local.service.ts` (SQLite) → raw CRUD calls, using the Zod schema to parse/validate at the boundary + `*.service.test.ts`
-3. `queries/order/useOrderQuery.ts` + `useOrderMutation.ts` + query tests (only if caching/invalidation is needed on top of the service)
-4. `hooks/order/useOrder.ts` → feature-level logic, form validation via the Zod schema, and the **only** entry point components use to reach `services`/`queries` + `useOrder.test.ts`
-5. Related UI components in `components/order/`, split into container (logic) + presentational (UI) as needed, + component tests
-6. Update `index.ts` in every relevant folder (barrel export)
-7. If global/UI state is needed → `stores/order.store.ts` using Zustand (+ store test)
-8. If constant values are needed (status enums, etc.) → `consts/order.consts.ts`
-9. If the model is persisted locally, add its table/columns to `libs/sqlite/migrations/`
-10. If needed, add factories/mocks for `Order` in `tests/factories/` and `tests/mocks/`
+2. `services/order/order.local.service.ts` (SQLite) → `getAllOrders()` for startup hydration, plus CRUD operations (`insertOrder`, `updateOrder`, `deleteOrder`), using the Zod schema to parse/validate at the boundary + `*.local.service.test.ts`
+3. If remote sync is needed: `services/order/order.service.ts` (remote) + `queries/order/useOrderQuery.ts` + query tests
+4. `stores/order/order.store.ts` → Zustand store holding the in-memory entity map/list, `hydrateOrders`, and optimistic mutation actions + `order.store.test.ts`
+5. Register model in app startup bootstrap (`libs/bootstrap.ts`) so `getAllOrders()` hydrates `useOrderStore` on app launch
+6. `hooks/order/useOrder.ts` → custom hook exposing store selectors for reading data, plus mutation functions that apply immediate store updates and immediately persist to `orderLocalService` (with rollback on error) + `useOrder.test.ts`
+7. Related UI components in `components/order/`, split into container (logic) + presentational (UI) as needed, consuming `useOrder()` only + component tests
+8. Update `index.ts` in every relevant folder (barrel export)
+9. If constant values are needed (status enums, etc.) → `consts/order.consts.ts`
+10. If the model is persisted locally, add its table/columns to `libs/sqlite/migrations/`
+11. If needed, add factories/mocks for `Order` in `tests/factories/` and `tests/mocks/`
 
 ---
 
 ## 8. Forbidden Practices
 
+- Direct communication between the UI (`components`) and the database (SQLite or raw API).
+- Reading data directly from SQLite or services inside UI components instead of reading from stores via custom hooks.
+- Persisting to SQLite without first applying the change to the state management system (Zustand).
+- Mutating the store without immediately persisting changes to the local database (when data is persistent).
+- Omitting startup model hydration from SQLite into stores on app launch.
 - Calling `fetch`/`axios` directly inside a component.
 - Writing business logic inside `components`.
 - Using `any` or `as any` without justification.
@@ -392,12 +498,11 @@ When adding a new database model (e.g. `Order`), the agent must follow these ste
 - Duplicating the same type definition across multiple files.
 - Using Class Components.
 - Hardcoding secrets/tokens in code (must live in `.env`).
-- Shipping a new service, query, hook, or component without a corresponding test.
+- Shipping a new service, query, hook, store, or component without a corresponding test.
 - Duplicating test fixtures/mocks instead of reusing `tests/factories/` and `tests/mocks/`.
 - Mixing UI rendering and business/data logic in the same component instead of splitting into container + presentational components.
 - Violating the Dependency Rule (e.g. a `service` importing from a `hook` or `component`).
-- Using any state library other than **Zustand** for global state, or any validation library other than **Zod** for schemas/forms.
-- Storing server/DB data inside a Zustand store instead of fetching it through `services`/`queries`.
+- Using any state library other than **Zustand** for state management, or any validation library other than **Zod** for schemas/forms.
 - Writing a raw SQL query or calling the SQLite client from anywhere outside `services/`.
 - Calling a `service` function directly from a `component` — services must always be reached through a `hook`.
 - Hand-writing a `interface`/`type` that duplicates a Zod schema's shape instead of using `z.infer`.
