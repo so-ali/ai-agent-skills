@@ -22,6 +22,16 @@ This document defines the rules, project structure, and standards that any AI ag
 - Use **environment variables** for secrets and values that differ between environments.
 - Follow accessibility (a11y) guidelines: `accessibilityLabel`, `accessibilityRole`, etc.
 - Code must be lint-clean (ESLint + Prettier) and checked before every commit.
+- Each component must have **exactly one type of responsibility**: either pure **UI** (presentational) or **logic** (container/orchestration) — never both:
+  - **Presentational components** (UI): receive data and callbacks via props, render markup/styles only, contain no business logic, no data fetching, no direct hook calls to `queries`/`services`.
+  - **Container components** (Logic): consume `hooks`, handle state/orchestration, and pass the results down as props to presentational components.
+  - If a component starts mixing rendering with business rules, split it into a container + a presentational component.
+- Follow **Clean Code** principles: meaningful names, small functions/components (prefer under ~150–200 lines), avoid deep nesting, no magic numbers/strings (use `consts`), no dead code, self-documenting code over excessive comments.
+- Follow **Clean Architecture** principles across the layers defined in this guide:
+  - **Dependency Rule**: dependencies only point inward/downward (`components → hooks → queries → services → API`); a lower layer must never import from a higher layer (e.g. `services` must never import from `hooks` or `components`).
+  - **SOLID**: especially Single Responsibility (one reason to change per file/component/hook) and Dependency Inversion (depend on `types`/interfaces, not concrete implementations, where it adds value).
+  - **DRY**: shared logic goes into `hooks`/`utils`, shared data shapes go into `types`, shared fixtures go into `tests/factories`.
+  - **KISS/YAGNI**: prefer the simplest solution that satisfies the requirement; do not add abstraction layers or configuration for hypothetical future needs.
 
 ---
 
@@ -50,11 +60,11 @@ src/
 | `context` | Context API + Providers | Only for state that is truly global/cross-cutting |
 | `hooks` | Reusable logic | Each hook should have a single responsibility |
 | `queries` | Query/mutation definitions (e.g. React Query) | Consumes `services` directly, never raw API calls |
-| `services` | API/database calls (axios, fetch, SDK) | No UI logic; pure input/output of data |
-| `stores` | App-wide state | e.g. user session, settings, theme |
-| `types` | Interface/Type per model | Single source of truth for data shape |
-| `utils` | Pure, side-effect-free functions | Date formatting, validation, etc. |
-| `libs` | Third-party library setup | e.g. `libs/axios.ts`, `libs/storage.ts` |
+| `services` | API/database calls (axios, fetch, SQLite) | No UI logic; pure input/output of data. **Only** layer allowed to touch SQLite directly |
+| `stores` | App-wide **client** state via **Zustand** | e.g. user session, theme, UI flags — never server/DB data |
+| `types` | Interface/Type + **Zod** schema per model | Types are inferred from Zod schemas (single source of truth) |
+| `utils` | Pure, side-effect-free functions | Date formatting, formatting helpers, etc. |
+| `libs` | Third-party library setup | e.g. `libs/axios.ts`, `libs/sqlite.ts`, `libs/storage.ts` |
 | `consts` | Project-wide constant values | Routes, colors, repeated strings, enums |
 | `tests` | Shared test setup, mocks, factories, test utils | Per-unit tests live next to their source file, not here |
 
@@ -172,7 +182,96 @@ const UserProfile = ({ id }: { id: string }) => {
 
 ---
 
-## 4. Testing
+## 4. State Management, Form Validation & Local Database
+
+### 4.1 State Management — Zustand
+
+- **Zustand** is the only allowed library for global/app-wide state, placed in `stores/`.
+- Each store is scoped to a single concern (e.g. `stores/session.store.ts`, `stores/theme.store.ts`, `stores/order.store.ts`) — no single "god store".
+- Stores hold **client/UI state** (session, theme, filters, onboarding flags, ephemeral UI state) — never server or database data. Server/DB data always flows through `services` → `queries`/`hooks`, not through Zustand.
+- Stores are consumed directly by `hooks` (and, when trivial, by presentational-adjacent logic inside container components) — never mutated directly from deep inside presentational components; expose actions from the store instead of letting components write to state directly.
+- Naming: `useXStore` for the store hook itself (e.g. `useSessionStore`), file name `x.store.ts`.
+
+```ts
+// stores/session/session.store.ts
+import { create } from 'zustand';
+
+interface SessionState {
+  userId: string | null;
+  isAuthenticated: boolean;
+  setSession: (userId: string) => void;
+  clearSession: () => void;
+}
+
+export const useSessionStore = create<SessionState>((set) => ({
+  userId: null,
+  isAuthenticated: false,
+  setSession: (userId) => set({ userId, isAuthenticated: true }),
+  clearSession: () => set({ userId: null, isAuthenticated: false }),
+}));
+```
+
+### 4.2 Form Validation — Zod
+
+- **Zod** is the only allowed library for schema and form validation.
+- Each model's Zod schema lives next to its types, e.g. `types/user/User.schema.ts`, and the TypeScript type is **inferred from the schema** (single source of truth):
+
+```ts
+// types/user/User.schema.ts
+import { z } from 'zod';
+
+export const createUserSchema = z.object({
+  name: z.string().min(2),
+  email: z.string().email(),
+});
+
+export type CreateUserPayload = z.infer<typeof createUserSchema>;
+```
+
+- `services` use the schema to validate/parse data at the boundary (API responses, DB rows) before returning it.
+- `hooks` use the schema to validate form input (e.g. with `react-hook-form` + `@hookform/resolvers/zod`) before calling a mutation.
+- Never duplicate a hand-written `interface` alongside a Zod schema for the same shape — infer the type from the schema instead.
+
+### 4.3 Local Database — SQLite
+
+- **SQLite** (e.g. `expo-sqlite` / `react-native-sqlite-storage` via a wrapper in `libs/sqlite.ts`) is the only allowed local persistence layer for structured/relational data.
+- The SQLite client/connection is configured **once** in `libs/sqlite.ts` and is never imported outside `services/`.
+- **No layer other than `services` may ever execute a raw SQL query or call the SQLite client directly.** This applies to `components`, `hooks`, `queries`, `stores`, and `context` alike.
+- Each model has its own DB-facing service function set, e.g. `services/user/user.local.service.ts`, alongside (or instead of) its remote `user.service.ts`, both exposed through the same barrel:
+
+```ts
+// services/user/user.local.service.ts
+import { db } from '@/libs';
+import { userRowSchema } from '@/types';
+import type { User } from '@/types';
+
+export const userLocalService = {
+  getUser: async (id: string): Promise<User> => {
+    const row = await db.getFirstAsync('SELECT * FROM users WHERE id = ?', [id]);
+    return userRowSchema.parse(row);
+  },
+  createUser: async (user: User): Promise<void> => {
+    await db.runAsync(
+      'INSERT INTO users (id, name, email, createdAt) VALUES (?, ?, ?, ?)',
+      [user.id, user.name, user.email, user.createdAt]
+    );
+  },
+};
+```
+
+- **Services must always be consumed through hooks, never called directly from components or from `stores`.** The mandatory chain for any data access (remote or local) is:
+
+  ```
+  Component → hooks/ → (queries/ →) services/ → SQLite / API
+  ```
+
+  - `queries/` may sit between `hooks` and `services` when caching/invalidation via React Query is useful (typical for reads).
+  - For simple local writes, a `hook` may call the `service` directly without a `queries` layer, but a `component` must never import a `service` itself.
+- Schema/migrations for SQLite live in `libs/sqlite/migrations/`, applied once at app startup — never ad hoc inside a service call.
+
+---
+
+## 5. Testing
 
 Every layer must be covered by automated tests. Tests are **colocated** with the file they test (e.g. `user.service.ts` → `user.service.test.ts`), while shared, cross-cutting test infrastructure lives in `tests/`.
 
@@ -208,13 +307,13 @@ tests/
 - Test file naming: `*.test.ts` / `*.test.tsx`, placed next to the source file.
 - Follow the **Arrange–Act–Assert** pattern inside each test.
 - Mock only the layer directly below the unit under test (e.g. when testing `hooks`, mock `queries` — don't mock `services` two layers down).
-- Every new model added per the checklist in Section 6 must ship with at least: one service test, one query test, one hook test, and one component test.
+- Every new model added per the checklist in Section 7 must ship with at least: one service test, one query test, one hook test, and one component test.
 - Snapshot tests should be used sparingly and only for stable, presentational components.
 - Aim for meaningful coverage of business logic (services, hooks, stores, utils) over raw percentage targets.
 
 ---
 
-## 5. Barrel Imports
+## 6. Barrel Imports
 
 Every folder (and every model sub-folder) must have an `index.ts` that re-exports its contents.
 
@@ -267,23 +366,24 @@ Rules:
 
 ---
 
-## 6. Checklist for Adding a New Model
+## 7. Checklist for Adding a New Model
 
 When adding a new database model (e.g. `Order`), the agent must follow these steps in order:
 
-1. `types/order/Order.types.ts` → define Types/Interfaces
-2. `services/order/order.service.ts` → raw CRUD calls + `order.service.test.ts`
-3. `queries/order/useOrderQuery.ts` + `useOrderMutation.ts` + query tests
-4. `hooks/order/useOrder.ts` → feature-level logic + `useOrder.test.ts`
-5. Related UI components in `components/order/` + component tests
+1. `types/order/Order.types.ts` + `types/order/Order.schema.ts` → define the Zod schema and infer the Type from it
+2. `services/order/order.service.ts` (remote) and/or `services/order/order.local.service.ts` (SQLite) → raw CRUD calls, using the Zod schema to parse/validate at the boundary + `*.service.test.ts`
+3. `queries/order/useOrderQuery.ts` + `useOrderMutation.ts` + query tests (only if caching/invalidation is needed on top of the service)
+4. `hooks/order/useOrder.ts` → feature-level logic, form validation via the Zod schema, and the **only** entry point components use to reach `services`/`queries` + `useOrder.test.ts`
+5. Related UI components in `components/order/`, split into container (logic) + presentational (UI) as needed, + component tests
 6. Update `index.ts` in every relevant folder (barrel export)
-7. If global state is needed → `stores/order.store.ts` (+ store test)
+7. If global/UI state is needed → `stores/order.store.ts` using Zustand (+ store test)
 8. If constant values are needed (status enums, etc.) → `consts/order.consts.ts`
-9. If needed, add factories/mocks for `Order` in `tests/factories/` and `tests/mocks/`
+9. If the model is persisted locally, add its table/columns to `libs/sqlite/migrations/`
+10. If needed, add factories/mocks for `Order` in `tests/factories/` and `tests/mocks/`
 
 ---
 
-## 7. Forbidden Practices
+## 8. Forbidden Practices
 
 - Calling `fetch`/`axios` directly inside a component.
 - Writing business logic inside `components`.
@@ -294,3 +394,10 @@ When adding a new database model (e.g. `Order`), the agent must follow these ste
 - Hardcoding secrets/tokens in code (must live in `.env`).
 - Shipping a new service, query, hook, or component without a corresponding test.
 - Duplicating test fixtures/mocks instead of reusing `tests/factories/` and `tests/mocks/`.
+- Mixing UI rendering and business/data logic in the same component instead of splitting into container + presentational components.
+- Violating the Dependency Rule (e.g. a `service` importing from a `hook` or `component`).
+- Using any state library other than **Zustand** for global state, or any validation library other than **Zod** for schemas/forms.
+- Storing server/DB data inside a Zustand store instead of fetching it through `services`/`queries`.
+- Writing a raw SQL query or calling the SQLite client from anywhere outside `services/`.
+- Calling a `service` function directly from a `component` — services must always be reached through a `hook`.
+- Hand-writing a `interface`/`type` that duplicates a Zod schema's shape instead of using `z.infer`.
